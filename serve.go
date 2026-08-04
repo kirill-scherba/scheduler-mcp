@@ -116,6 +116,9 @@ func schedulerTools() []server.ServerTool {
 			for _, t := range tasks {
 				sb.WriteString(fmt.Sprintf("%s  %s  %s  [%s]  %s\n",
 					t.ID[:8], t.When, t.Status, t.Author, truncate(t.Action, 60)))
+				if t.Result != "" && t.Result != "executed (stub)" {
+					sb.WriteString(fmt.Sprintf("        → %s\n", truncate(t.Result, 120)))
+				}
 			}
 			return mcp.NewToolResultText(sb.String()), nil
 		},

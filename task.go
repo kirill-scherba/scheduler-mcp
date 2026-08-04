@@ -49,13 +49,18 @@ type TaskUpdate struct {
 
 // Scheduler is the in-memory task store with a ticker.
 type Scheduler struct {
-	mu    sync.Mutex
-	tasks map[string]*Task
-	every time.Duration // ticker interval
+	mu       sync.Mutex
+	tasks    map[string]*Task
+	every    time.Duration // ticker interval
+	sem      chan struct{} // bounded concurrency
+	executor *executor
 }
 
 // SchedulerInstance is the global scheduler used by MCP tools.
 var SchedulerInstance = NewScheduler(10 * time.Second)
+
+// maxConcurrent is the default limit of simultaneously running tasks.
+const maxConcurrent = 3
 
 // scheduler is a shorthand used by serve.go.
 var scheduler = SchedulerInstance
@@ -63,8 +68,10 @@ var scheduler = SchedulerInstance
 // NewScheduler creates a scheduler with the given tick interval.
 func NewScheduler(tick time.Duration) *Scheduler {
 	s := &Scheduler{
-		tasks: map[string]*Task{},
-		every: tick,
+		tasks:    map[string]*Task{},
+		every:    tick,
+		sem:      make(chan struct{}, maxConcurrent),
+		executor: newExecutor(),
 	}
 	s.Start()
 	return s
@@ -204,16 +211,33 @@ func (s *Scheduler) checkDue() {
 	}
 }
 
-// execute runs a due task. For now it just marks done with a stub result;
-// the opencode-session executor lands in a follow-up.
+// execute runs a due task via the opencode executor (bounded concurrency).
 func (s *Scheduler) execute(t *Task) {
-	// TODO: spawn opencode session (opencode-client) with t.Action
-	s.mu.Lock()
-	t.Status = StatusDone
-	t.Result = "executed (stub)"
-	t.UpdatedAt = time.Now().UTC()
-	s.mu.Unlock()
-	s.persist()
+	// Bounded concurrency: at most maxConcurrent tasks run at once.
+	s.sem <- struct{}{}
+	go func() {
+		defer func() { <-s.sem }()
+
+		result, err := s.executor.run(t)
+		s.mu.Lock()
+		if err != nil {
+			t.Status = StatusFailed
+			t.Result = "error: " + err.Error()
+		} else {
+			t.Status = StatusDone
+			t.Result = result
+		}
+		t.UpdatedAt = time.Now().UTC()
+		s.mu.Unlock()
+		s.persist()
+
+		// Notify Kirill in his opencode chat about completion/failure.
+		status := "выполнена"
+		if err != nil {
+			status = "упала"
+		}
+		notify("scheduler", fmt.Sprintf("Задача %s %s: %s", t.ID[:8], status, truncate(t.Action, 60)))
+	}()
 }
 
 // persist saves tasks to memory-store (memory/scheduler/tasks).
