@@ -50,7 +50,7 @@ func (e *executor) run(t *Task) (string, error) {
 
 	// Session name: stable per task, allows reuse across retries.
 	sessionName := "sched-" + t.ID[:8]
-	sess, err := e.client.CreateSession(sessionName, t.Agent, t.Model, "", nil)
+	sess, err := e.client.CreateSession(sessionName, t.Agent, t.Model, "", "scheduler", nil)
 	if err != nil {
 		return "", fmt.Errorf("create session: %w", err)
 	}
