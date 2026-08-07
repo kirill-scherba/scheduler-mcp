@@ -5,11 +5,15 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
+	"log"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
+	memoryclient "github.com/kirill-scherba/memory-store-mcp/client"
 )
 
 // Task statuses
@@ -36,6 +40,8 @@ type Task struct {
 	Expired   string    `json:"expired"` // run | skip (one-off overdue policy)
 	Status    string    `json:"status"`
 	Result    string    `json:"result,omitempty"`
+	Runs      int       `json:"runs,omitempty"`      // executions so far (recurring tasks)
+	LastRun   string    `json:"last_run,omitempty"`  // RFC3339 of the last execution
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
@@ -54,6 +60,7 @@ type Scheduler struct {
 	every    time.Duration // ticker interval
 	sem      chan struct{} // bounded concurrency
 	executor *executor
+	mem      *memoryclient.Client // shared memory-store client
 }
 
 // SchedulerInstance is the global scheduler used by MCP tools.
@@ -72,7 +79,9 @@ func NewScheduler(tick time.Duration) *Scheduler {
 		every:    tick,
 		sem:      make(chan struct{}, maxConcurrent),
 		executor: newExecutor(),
+		mem:      memoryclient.New(),
 	}
+	s.load() // restore persisted tasks from memory-store (best-effort)
 	s.Start()
 	return s
 }
@@ -223,8 +232,18 @@ func (s *Scheduler) execute(t *Task) {
 		if err != nil {
 			t.Status = StatusFailed
 			t.Result = "error: " + err.Error()
+		} else if t.EveryDur > 0 {
+			// Recurring task: schedule the next run and keep it pending.
+			t.Status = StatusPending
+			t.WhenTime = t.WhenTime.Add(t.EveryDur)
+			t.When = t.WhenTime.Format(time.RFC3339)
+			t.Runs++
+			t.LastRun = time.Now().UTC().Format(time.RFC3339)
+			t.Result = result
 		} else {
 			t.Status = StatusDone
+			t.Runs++
+			t.LastRun = time.Now().UTC().Format(time.RFC3339)
 			t.Result = result
 		}
 		t.UpdatedAt = time.Now().UTC()
@@ -240,16 +259,69 @@ func (s *Scheduler) execute(t *Task) {
 	}()
 }
 
-// persist saves tasks to memory-store (memory/scheduler/tasks).
-// TODO: implement via memory-store-mcp HTTP API.
+// tasksKey is the memory-store key holding the task snapshot.
+const tasksKey = "memory/scheduler/tasks"
+
+// persist saves tasks to memory-store via the shared memory client.
+// Called outside the lock (takes it itself).
 func (s *Scheduler) persist() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.persistLocked()
 }
 
+// persistLocked saves tasks without taking the lock. Callers must hold s.mu.
 func (s *Scheduler) persistLocked() {
-	// TODO: write tasks snapshot to memory-store
+	data, err := json.MarshalIndent(s.tasks, "", "  ")
+	if err != nil {
+		log.Printf("persist: marshal: %v", err)
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := s.mem.Save(ctx, tasksKey, string(data), "scheduler-mcp task snapshot"); err != nil {
+		log.Printf("persist: save to memory: %v", err)
+	}
+}
+
+// load restores tasks from memory-store (best-effort).
+func (s *Scheduler) load() {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	entry, err := s.mem.Get(ctx, tasksKey)
+	if err != nil {
+		log.Printf("load: %v", err)
+		return
+	}
+	if entry == nil {
+		return // no snapshot yet
+	}
+	var tasks map[string]*Task
+	if err := json.Unmarshal([]byte(entry.Content), &tasks); err != nil {
+		log.Printf("load: unmarshal: %v", err)
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for id, t := range tasks {
+		if t == nil {
+			continue
+		}
+		t.WhenTime, _ = time.Parse(time.RFC3339, t.When)
+		if t.Every != "" {
+			if d, err := time.ParseDuration(t.Every); err == nil {
+				t.EveryDur = d
+			}
+		}
+		// Tasks left running by a crashed process go back to pending.
+		if t.Status == StatusRunning {
+			t.Status = StatusPending
+		}
+		s.tasks[id] = t
+	}
+	if len(s.tasks) > 0 {
+		log.Printf("scheduler: restored %d tasks from memory", len(s.tasks))
+	}
 }
 
 // parseWhen parses an ISO 8601 time.

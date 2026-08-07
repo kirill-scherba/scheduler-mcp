@@ -6,8 +6,11 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
@@ -17,16 +20,18 @@ import (
 func serveCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "serve",
-		Short: "Run MCP server (stdio)",
-		Long:  "Start MCP server for AI agents using mcp-go.",
+		Short: "Run MCP server (stdio or HTTP)",
+		Long:  "Start MCP server for AI agents using mcp-go. Use --http to enable StreamableHTTP transport.",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return serveMCP()
+			httpAddr, _ := cmd.Flags().GetString("http")
+			return serveMCP(httpAddr)
 		},
 	}
+	cmd.Flags().String("http", "", "HTTP listen address (enables StreamableHTTP transport, e.g. ':7713')")
 	return cmd
 }
 
-func serveMCP() error {
+func serveMCP(httpAddr string) error {
 	s := server.NewMCPServer(
 		"scheduler-mcp",
 		"0.1.0",
@@ -35,6 +40,77 @@ func serveMCP() error {
 
 	s.AddTools(schedulerTools()...)
 
+	// ── MCP Resources ──────────────────────────────────────────────────────
+	// Human-friendly @-menu access: Kirill can insert live task list and
+	// statistics into the chat without formulating a query.
+
+	// scheduler://tasks — full task list
+	tasksRes := mcp.NewResource("scheduler://tasks",
+		"Scheduled Tasks",
+		mcp.WithResourceDescription("List of scheduled tasks with status, time, author and result"),
+		mcp.WithMIMEType("application/json"),
+	)
+	s.AddResource(tasksRes, func(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
+		tasks := scheduler.List("")
+		type taskView struct {
+			ID        string `json:"id"`
+			When      string `json:"when"`
+			Every     string `json:"every,omitempty"`
+			Status    string `json:"status"`
+			Agent     string `json:"agent,omitempty"`
+			Author    string `json:"author"`
+			Action    string `json:"action"`
+			Result    string `json:"result,omitempty"`
+			CreatedAt string `json:"created_at"`
+			UpdatedAt string `json:"updated_at"`
+		}
+		views := make([]taskView, 0, len(tasks))
+		for _, t := range tasks {
+			views = append(views, taskView{
+				ID: t.ID, When: t.When, Every: t.Every, Status: t.Status,
+				Agent: t.Agent, Author: t.Author, Action: t.Action, Result: t.Result,
+				CreatedAt: t.CreatedAt.Format(time.RFC3339),
+				UpdatedAt: t.UpdatedAt.Format(time.RFC3339),
+			})
+		}
+		data, _ := json.MarshalIndent(views, "", "  ")
+		return []mcp.ResourceContents{
+			mcp.TextResourceContents{
+				URI:      "scheduler://tasks",
+				MIMEType: "application/json",
+				Text:     string(data),
+			},
+		}, nil
+	})
+
+	// scheduler://stats — execution statistics
+	statsRes := mcp.NewResource("scheduler://stats",
+		"Scheduler Stats",
+		mcp.WithResourceDescription("Scheduler execution statistics: totals by status"),
+		mcp.WithMIMEType("application/json"),
+	)
+	s.AddResource(statsRes, func(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
+		tasks := scheduler.List("")
+		stats := map[string]int{}
+		for _, t := range tasks {
+			stats[t.Status]++
+		}
+		stats["total"] = len(tasks)
+		data, _ := json.MarshalIndent(stats, "", "  ")
+		return []mcp.ResourceContents{
+			mcp.TextResourceContents{
+				URI:      "scheduler://stats",
+				MIMEType: "application/json",
+				Text:     string(data),
+			},
+		}, nil
+	})
+
+	if httpAddr != "" {
+		log.Printf("Starting scheduler-mcp StreamableHTTP on %s", httpAddr)
+		httpServer := server.NewStreamableHTTPServer(s, server.WithStateLess(true))
+		return httpServer.Start(httpAddr)
+	}
 	return server.ServeStdio(s)
 }
 
@@ -179,6 +255,45 @@ func schedulerTools() []server.ServerTool {
 				return mcp.NewToolResultError(err.Error()), nil
 			}
 			return mcp.NewToolResultText("Task updated: " + id), nil
+		},
+	})
+
+	// scheduler_stats
+	statsTool := mcp.NewTool("scheduler_stats",
+		mcp.WithDescription("Scheduler execution statistics: totals by status, total runs, average task duration"),
+	)
+	tools = append(tools, server.ServerTool{
+		Tool: statsTool,
+		Handler: func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			tasks := scheduler.List("")
+			byStatus := map[string]int{}
+			totalRuns := 0
+			for _, t := range tasks {
+				byStatus[t.Status]++
+				totalRuns += t.Runs
+			}
+			// Average duration for finished tasks (done/failed).
+			var avgMs, n int64
+			for _, t := range tasks {
+				if t.Status == StatusDone || t.Status == StatusFailed {
+					d := t.UpdatedAt.Sub(t.CreatedAt).Milliseconds()
+					if d > 0 {
+						avgMs += d
+						n++
+					}
+				}
+			}
+			if n > 0 {
+				avgMs /= n
+			}
+			stats := map[string]any{
+				"total":           len(tasks),
+				"by_status":       byStatus,
+				"total_runs":      totalRuns,
+				"avg_duration_ms": avgMs,
+			}
+			data, _ := json.MarshalIndent(stats, "", "  ")
+			return mcp.NewToolResultText(string(data)), nil
 		},
 	})
 
