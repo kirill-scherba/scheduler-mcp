@@ -70,10 +70,17 @@ func (e *executor) run(t *Task) (string, error) {
 
 	select {
 	case <-ctx.Done():
+		// Best-effort: release the session on timeout too.
+		_ = e.client.CloseSessionID(sess.ID)
 		return "", fmt.Errorf("task timeout: %w", ctx.Err())
 	case r := <-respCh:
 		if r.err != nil {
 			return "", fmt.Errorf("send message: %w", r.err)
+		}
+		// Release the session after the task completes (best-effort),
+		// so recurring tasks do not accumulate sessions in opencode-serve.
+		if err := e.client.CloseSessionID(sess.ID); err != nil {
+			fmt.Fprintf(os.Stderr, "close session: %v\n", err)
 		}
 		return r.text, nil
 	}
