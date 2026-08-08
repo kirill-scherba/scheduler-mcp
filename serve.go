@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"log"
 	"strings"
-	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
@@ -48,37 +47,33 @@ func serveMCP(httpAddr string) error {
 	tasksRes := mcp.NewResource("scheduler://tasks",
 		"Scheduled Tasks",
 		mcp.WithResourceDescription("List of scheduled tasks with status, time, author and result"),
-		mcp.WithMIMEType("application/json"),
+		mcp.WithMIMEType("text/plain"),
 	)
 	s.AddResource(tasksRes, func(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
 		tasks := scheduler.List("")
-		type taskView struct {
-			ID        string `json:"id"`
-			When      string `json:"when"`
-			Every     string `json:"every,omitempty"`
-			Status    string `json:"status"`
-			Agent     string `json:"agent,omitempty"`
-			Author    string `json:"author"`
-			Action    string `json:"action"`
-			Result    string `json:"result,omitempty"`
-			CreatedAt string `json:"created_at"`
-			UpdatedAt string `json:"updated_at"`
+		var sb strings.Builder
+		if len(tasks) == 0 {
+			sb.WriteString("📋 Задач нет")
+		} else {
+			sb.WriteString(fmt.Sprintf("📋 Задачи scheduler: %d\n\n", len(tasks)))
+			for i, t := range tasks {
+				sb.WriteString(fmt.Sprintf("[%d] %s · %s\n", i+1, t.ID[:8], truncate(t.Action, 60)))
+				sb.WriteString(fmt.Sprintf("    when: %s · every: %s · status: %s\n", t.When, t.Every, t.Status))
+				sb.WriteString(fmt.Sprintf("    author: %s · agent: %s · runs: %d\n", t.Author, t.Agent, t.Runs))
+				if t.LastRun != "" {
+					sb.WriteString(fmt.Sprintf("    last_run: %s\n", t.LastRun))
+				}
+				if t.Result != "" {
+					sb.WriteString(fmt.Sprintf("    result: %s\n", truncate(t.Result, 120)))
+				}
+				sb.WriteString("\n")
+			}
 		}
-		views := make([]taskView, 0, len(tasks))
-		for _, t := range tasks {
-			views = append(views, taskView{
-				ID: t.ID, When: t.When, Every: t.Every, Status: t.Status,
-				Agent: t.Agent, Author: t.Author, Action: t.Action, Result: t.Result,
-				CreatedAt: t.CreatedAt.Format(time.RFC3339),
-				UpdatedAt: t.UpdatedAt.Format(time.RFC3339),
-			})
-		}
-		data, _ := json.MarshalIndent(views, "", "  ")
 		return []mcp.ResourceContents{
 			mcp.TextResourceContents{
 				URI:      "scheduler://tasks",
-				MIMEType: "application/json",
-				Text:     string(data),
+				MIMEType: "text/plain",
+				Text:     sb.String(),
 			},
 		}, nil
 	})
