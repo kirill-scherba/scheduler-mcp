@@ -54,6 +54,10 @@ func (e *executor) run(t *Task) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("create session: %w", err)
 	}
+	// Always release the session when done — including SendMessage errors
+	// and timeouts — so recurring tasks do not accumulate sessions in
+	// opencode-serve (DELETE /session/{id}).
+	defer e.client.CloseSessionID(sess.ID)
 
 	// Send the action prompt and wait for the reply. The client's
 	// SendMessage has its own internal timeout; wrap with ctx so the
@@ -70,17 +74,11 @@ func (e *executor) run(t *Task) (string, error) {
 
 	select {
 	case <-ctx.Done():
-		// Best-effort: release the session on timeout too.
-		_ = e.client.CloseSessionID(sess.ID)
+		// The deferred CloseSessionID releases the session on timeout.
 		return "", fmt.Errorf("task timeout: %w", ctx.Err())
 	case r := <-respCh:
 		if r.err != nil {
 			return "", fmt.Errorf("send message: %w", r.err)
-		}
-		// Release the session after the task completes (best-effort),
-		// so recurring tasks do not accumulate sessions in opencode-serve.
-		if err := e.client.CloseSessionID(sess.ID); err != nil {
-			fmt.Fprintf(os.Stderr, "close session: %v\n", err)
 		}
 		return r.text, nil
 	}
