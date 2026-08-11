@@ -32,19 +32,25 @@ for the agent.
 ## Architecture
 
 ```
-scheduler-mcp (Go, MCP server via mcp-gateway)
-├── MCP tools: scheduler_create / list / cancel / update
+scheduler-mcp (Go, MCP server, own systemd service on HTTP :7713)
+├── MCP tools: scheduler_create / list / cancel / update / stats
+├── MCP resources: scheduler://tasks, scheduler://stats (@ menu)
 ├── Store: in-memory map + mutex, persisted to memory-store (memory/scheduler/tasks)
 ├── Ticker goroutine: checks due tasks every N seconds (default 10s)
-├── Executor: spawns opencode session (opencode-client) with the task prompt
-└── Workers: bounded concurrency pool (max_concurrent) + per-task timeout
+├── Executor: spawns opencode session (opencode-client) with the task prompt,
+│             closes the session after the run
+└── Workers: bounded concurrency pool (max_concurrent=3) + per-task timeout (10m)
 ```
 
-- Deployed as an MCP server connected to mcp-gateway (like wallet-mcp).
-  No standalone systemd service needed — it runs while the gateway is up.
+- Runs as its **own systemd service** on `127.0.0.1:7713` (StreamableHTTP)
+  and is registered in mcp-gateway as a **remote proxy** — resources only
+  work for remote servers (gateway disables resources for `local`).
 - **No SQLite.** Tasks live in memory; a snapshot is saved to memory-store
-  (`memory/scheduler/tasks`) on create/update and restored on startup, so
-  tasks survive a gateway restart.
+  (`memory/scheduler/tasks`) via `memory-store-mcp/client` on create/update
+  and restored on startup, so tasks survive restarts.
+- **Session cleanup:** after each run the executor closes the opencode
+  session (`DELETE /session/{id}`) — recurring tasks do not accumulate
+  sessions in opencode-serve.
 
 ## Task model
 
@@ -66,17 +72,27 @@ scheduler-mcp (Go, MCP server via mcp-gateway)
 }
 ```
 
-## MCP tools (4)
+## MCP tools (5)
 
 ```text
 scheduler_create(when, action, [author, source, agent, every, expired])
 scheduler_list([status])
 scheduler_cancel(id)
 scheduler_update(id, [when, action, every])
+scheduler_stats()   // totals by status, total runs, avg duration
 ```
 
-A **skill** (docs + agent instructions) teaches the agent how to formulate
-tasks and use the tools. Tools stay minimal (4); rules live in the skill.
+## MCP resources (@ menu, human-readable)
+
+```text
+scheduler://tasks   // «@ Scheduled Tasks» — clean text list of all tasks
+scheduler://stats   // «@ Scheduler Stats» — totals by status, runs
+```
+
+The **skill** (`~/.config/opencode/skills/scheduler-mcp/`, copy in
+`matrica/config/opencode/skills/scheduler-mcp/`) teaches the agent how to
+formulate tasks, use the tools, and shows the canonical display format for
+tasks (kept consistent everywhere).
 
 ## Security — author and source provenance
 
@@ -124,16 +140,18 @@ mail, but for tasks.
   mark task `failed`.
 
 ### Results
-- On completion the result is written to memory-store
-  (`memory/scheduler/results/<id>`). Especially for question tasks
-  ("choose an omelette recipe") — the answer lives only in memory results.
+- On completion the result is stored **on the task** (in
+  `memory/scheduler/tasks`), so `scheduler_list` / `@Scheduled Tasks` show the
+  last outcome. History per period is a planned feature
+  (`scheduler_stats from/to`).
 
 ## Open questions
 
-1. **Error notifications** — not designed anywhere in Matrica yet.
-   Proposal: write errors to memory + logs now; Discord errors as a shared
-   mechanism later.
+1. **History per period** — `scheduler_stats from/to` reading events in
+   `memory/scheduler/history/<date>/`. «Что делал scheduler за неделю».
 2. **Natural-language `when` parser** — "10:00", "tomorrow 10:00", "in 30
-   minutes", "Fri 20:00", timezone. Separate sub-task.
-3. **Recurring boundary case:** if scheduler was down across a boundary,
-   "run once if overdue < period, else skip" (above) — confirm.
+   minutes", "Fri 20:00", timezone. Separate sub-task. Currently agents
+   convert to ISO 8601 themselves.
+3. **Night window for recurring tasks** — handled in the task prompt
+   («если ночь 22–8 — завершись»); a scheduler-level `hours` window is a
+   possible future feature.
