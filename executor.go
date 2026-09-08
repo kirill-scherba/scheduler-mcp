@@ -26,8 +26,10 @@ const (
 	opencodeBaseURL = "http://127.0.0.1:7709"
 	// notifyURL is the notifications.ts plugin HTTP endpoint.
 	notifyURL = "http://127.0.0.1:7799/notify"
-	// defaultTaskTimeout bounds a single task execution.
-	defaultTaskTimeout = 10 * time.Minute
+	// defaultTaskTimeout bounds a single task execution. Job-hunter needs
+	// more headroom: it runs several searches, per-vacancy fetches, LLM
+	// analysis and a Discord post within one task.
+	defaultTaskTimeout = 30 * time.Minute
 )
 
 // executor runs due tasks via opencode-client.
