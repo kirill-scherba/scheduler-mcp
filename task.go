@@ -61,6 +61,7 @@ type Scheduler struct {
 	sem      chan struct{} // bounded concurrency
 	executor *executor
 	mem      *memoryclient.Client // shared memory-store client
+	loaded   bool                 // tasks successfully loaded from memory
 }
 
 // SchedulerInstance is the global scheduler used by MCP tools.
@@ -87,10 +88,23 @@ func NewScheduler(tick time.Duration) *Scheduler {
 }
 
 // Start launches the ticker goroutine that checks due tasks.
+// While tasks are not loaded yet (memory store was down at startup) it keeps
+// retrying the load roughly once a minute, and checkDue does nothing.
 func (s *Scheduler) Start() {
 	go func() {
+		ticks := 0
 		for {
 			time.Sleep(s.every)
+			s.mu.Lock()
+			loaded := s.loaded
+			s.mu.Unlock()
+			if !loaded {
+				ticks++
+				if ticks%6 == 0 { // ~every 60s at the default 10s tick
+					s.loadOnce()
+				}
+				continue
+			}
 			s.checkDue()
 		}
 	}()
@@ -272,6 +286,13 @@ func (s *Scheduler) persist() {
 
 // persistLocked saves tasks without taking the lock. Callers must hold s.mu.
 func (s *Scheduler) persistLocked() {
+	// Never overwrite the stored snapshot before it has been loaded:
+	// if load failed (memory store was down at startup) the in-memory map
+	// is empty and writing it would wipe all persisted tasks.
+	if !s.loaded {
+		log.Printf("persist: skipped — tasks not loaded from memory yet (would overwrite)")
+		return
+	}
 	data, err := json.MarshalIndent(s.tasks, "", "  ")
 	if err != nil {
 		log.Printf("persist: marshal: %v", err)
@@ -338,6 +359,7 @@ func (s *Scheduler) loadOnce() bool {
 		}
 		s.tasks[id] = t
 	}
+	s.loaded = true
 	if len(s.tasks) > 0 {
 		log.Printf("scheduler: restored %d tasks from memory", len(s.tasks))
 	}
