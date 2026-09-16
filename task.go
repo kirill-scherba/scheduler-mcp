@@ -284,22 +284,41 @@ func (s *Scheduler) persistLocked() {
 	}
 }
 
-// load restores tasks from memory-store (best-effort).
+// load restores tasks from memory-store (best-effort) with retries:
+// on startup the memory store may not be ready yet (connection refused),
+// and a single failed attempt would silently leave the scheduler empty.
 func (s *Scheduler) load() {
+	const attempts = 5
+	for i := 1; i <= attempts; i++ {
+		if s.loadOnce() {
+			return
+		}
+		if i < attempts {
+			log.Printf("load: attempt %d/%d failed, retrying in 5s", i, attempts)
+			time.Sleep(5 * time.Second)
+		} else {
+			log.Printf("load: all %d attempts failed — tasks not restored", attempts)
+		}
+	}
+}
+
+// loadOnce performs a single load attempt; returns true if it succeeded
+// (even when there is no snapshot yet — the memory store answered).
+func (s *Scheduler) loadOnce() bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	entry, err := s.mem.Get(ctx, tasksKey)
 	if err != nil {
 		log.Printf("load: %v", err)
-		return
+		return false
 	}
 	if entry == nil {
-		return // no snapshot yet
+		return true // no snapshot yet
 	}
 	var tasks map[string]*Task
 	if err := json.Unmarshal([]byte(entry.Content), &tasks); err != nil {
 		log.Printf("load: unmarshal: %v", err)
-		return
+		return true // store answered; data is bad — retrying won't help
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -322,6 +341,7 @@ func (s *Scheduler) load() {
 	if len(s.tasks) > 0 {
 		log.Printf("scheduler: restored %d tasks from memory", len(s.tasks))
 	}
+	return true
 }
 
 // parseWhen parses an ISO 8601 time.
