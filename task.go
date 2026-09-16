@@ -250,9 +250,16 @@ func (s *Scheduler) execute(t *Task) {
 			// Recurring task: schedule the next run and keep it pending.
 			t.Status = StatusPending
 			t.WhenTime = t.WhenTime.Add(t.EveryDur)
+			// Skip missed slots: if the scheduler was down (or a task was
+			// restored far in the past), jump to the first slot in the future
+			// instead of catching up one period at a time.
+			now := time.Now().UTC()
+			for t.WhenTime.Before(now) {
+				t.WhenTime = t.WhenTime.Add(t.EveryDur)
+			}
 			t.When = t.WhenTime.Format(time.RFC3339)
 			t.Runs++
-			t.LastRun = time.Now().UTC().Format(time.RFC3339)
+			t.LastRun = now.Format(time.RFC3339)
 			t.Result = result
 		} else {
 			t.Status = StatusDone
