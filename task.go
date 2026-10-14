@@ -206,6 +206,14 @@ func (s *Scheduler) Update(id string, upd TaskUpdate) error {
 		}
 	}
 	t.UpdatedAt = time.Now().UTC()
+	// Rescheduling revives a task: checkDue() only runs pending ones, so without this a recurring
+	// task that failed once (a transient opencode error, a restart) would stay dead for good.
+	// Setting a new time or period is an explicit "run it again".
+	if upd.When != nil || upd.Every != nil {
+		if t.Status == StatusFailed || t.Status == StatusDone {
+			t.Status = StatusPending
+		}
+	}
 	s.persistLocked()
 	return nil
 }
